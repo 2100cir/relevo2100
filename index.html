@@ -206,7 +206,7 @@
 </head>
 <body>
 
-<div id="lockScreen" class="hidden">
+<div id="lockScreen">
   <div class="lock-box">
     <h2>Acceso restringido</h2>
     <p>Introduce el PIN de la unidad para ver el relevo</p>
@@ -287,43 +287,35 @@ let capacities = {
   otros: 150 
 };
 
-// ===== PIN: se guarda en el dispositivo (no se pierde al recargar ni al
-// volver de otra app en el móvil) y caduca a las 12 h SIN uso =====
+// ===== PIN: se pide SIEMPRE al abrir o recargar la web. Durante el uso se
+// mantiene en memoria (no te echa mientras trabajas). Solo se vuelve a pedir
+// si el servidor lo rechaza. =====
 const PIN_KEY = 'relevoPin';
-const PIN_TTL_MS = 12 * 60 * 60 * 1000;
-
-function getPin(){
-  try{
-    const raw = localStorage.getItem(PIN_KEY);
-    if(raw){
-      const o = JSON.parse(raw);
-      if(o && o.pin && (Date.now() - o.t) < PIN_TTL_MS) return o.pin;
-      localStorage.removeItem(PIN_KEY);
-    }
-  }catch(e){}
-  try{ return sessionStorage.getItem(PIN_KEY) || ''; }catch(e){ return ''; }
-}
+let currentPin = '';
+function getPin(){ return currentPin; }
 function setPin(pin){
-  try{ localStorage.setItem(PIN_KEY, JSON.stringify({ pin, t: Date.now() })); }
-  catch(e){ try{ sessionStorage.setItem(PIN_KEY, pin); }catch(e2){} }
+  currentPin = pin;
+  try{ sessionStorage.setItem(PIN_KEY, pin); }catch(e){}   // solo para validar la copia rápida (ver abajo)
 }
 function clearPin(){
-  try{ localStorage.removeItem(PIN_KEY); }catch(e){}
+  currentPin = '';
   try{ sessionStorage.removeItem(PIN_KEY); }catch(e){}
 }
+// limpieza de la versión anterior, que guardaba el PIN en el dispositivo
+try{ localStorage.removeItem(PIN_KEY); }catch(e){}
 
 // ===== Copia de los últimos datos (solo mientras la pestaña esté abierta)
 // para pintar la web al instante y refrescar en segundo plano =====
 const CACHE_KEY = 'relevoCache';
 let cacheTimer = null;
 function saveDataCache(){
-  try{ sessionStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), data: roomsData })); }catch(e){}
+  try{ sessionStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), pin: currentPin, data: roomsData })); }catch(e){}
 }
 function saveDataCacheSoon(){ clearTimeout(cacheTimer); cacheTimer = setTimeout(saveDataCache, 500); }
 function loadDataCache(){
   try{
     const o = JSON.parse(sessionStorage.getItem(CACHE_KEY));
-    return (o && Array.isArray(o.data) && o.data.length) ? o : null;
+    return (o && o.pin && Array.isArray(o.data) && o.data.length) ? o : null;
   }catch(e){ return null; }
 }
 function clearDataCache(){ try{ sessionStorage.removeItem(CACHE_KEY); }catch(e){} }
@@ -380,13 +372,13 @@ async function doLoadData(){
   if(!json.ok){
     if(json.error === 'PIN incorrecto'){
       clearPin(); clearDataCache();
+      roomsData = []; document.getElementById('rooms').replaceChildren();
       showLock('PIN incorrecto. Inténtalo de nuevo.');
       return false;
     }
     setStatus('Error al cargar: ' + (json.error || 'desconocido'), 'err');
     return false;
   }
-  setPin(pin);            // renueva las 12 h de sesión
   hideLock();
   roomsData = json.data;
   saveDataCache();
@@ -430,6 +422,16 @@ async function tryUnlock(){
   btn.disabled = true;
   pinInputEl.disabled = true;
   btn.textContent = 'Entrando…';
+
+  // Copia rápida: solo si el PIN tecleado es el mismo que validó esos datos
+  // en esta pestaña. Se pinta al instante y se refresca en segundo plano.
+  const cached = loadDataCache();
+  if(cached && cached.pin === pin && !roomsData.length){
+    roomsData = cached.data;
+    render();
+    hideLock();
+    document.getElementById('lastSync').textContent = 'Datos de las ' + new Date(cached.t).toLocaleTimeString('es-ES', {hour:'2-digit', minute:'2-digit'}) + ' (actualizando…)';
+  }
 
   const success = await loadData();
 
@@ -738,10 +740,14 @@ function makeEspecialidadSelect(roomCode, value){
     select.appendChild(o);
   });
   applyEspecialidadColor(select);
+  let lastSaved = select.value;
   select.addEventListener('change', () => {
     applyEspecialidadColor(select);
-    select.classList.add('dirty'); select.classList.remove('saved');
-    scheduleSave(roomCode, 'especialidad', select.value, select);
+    select.classList.add('dirty'); select.classList.remove('saved', 'error');
+    const val = select.value;
+    scheduleSave(roomCode, 'especialidad', val, select,
+      () => { lastSaved = val; },
+      () => { select.value = lastSaved; applyEspecialidadColor(select); });
   });
   return select;
 }
@@ -792,8 +798,8 @@ function queueSave(item){
   pending.set(key, item);
 }
 
-function scheduleSave(roomCode, field, value, box){
-  queueSave({ kind: 'plain', room: roomCode, field, value, box });
+function scheduleSave(roomCode, field, value, box, onOk, onFail){
+  queueSave({ kind: 'plain', room: roomCode, field, value, box, onOk, onFail });
 }
 function scheduleSaveRich(div, box){
   queueSave({ kind: 'rich', room: div.dataset.room, field: div.dataset.field, div, box });
@@ -857,12 +863,14 @@ async function flushQueue(){
       if(item.kind === 'rich') patchCache(item.room, item.field, item.sentText, item.sentHtml);
       else patchCache(item.room, item.field, item.value);
       if(!newer && item.box){ item.box.classList.remove('dirty', 'error'); item.box.classList.add('saved'); }
+      if(!newer && item.onOk) item.onOk();
       return;
     }
     if(newer) return;
     if(r && !r.ok){                              // fallo concreto de ese campo: no se reintenta
       if(item.box){ item.box.classList.remove('dirty', 'saved'); item.box.classList.add('error'); }
       failed.push(r.error || 'Error al guardar'); failedByKey.set(item.key, failed[failed.length-1]);
+      if(item.onFail) item.onFail();      // el selector vuelve al valor que SÍ está en el Sheet
       return;
     }
     // fallo de toda la petición (conexión, candado ocupado, PIN...)
@@ -881,12 +889,15 @@ async function flushQueue(){
     showLock('Tu sesión ha caducado. Vuelve a introducir el PIN (tus cambios se guardarán al entrar).');
     return;
   }
-  if(failedByKey.size){
-    setStatus('Error al guardar: ' + failedByKey.values().next().value, 'err');
+  if(failed.length){
+    setStatus('NO guardado: ' + failed[0], 'err');
   } else if(retry){
     setStatus('Sin conexión con Google; reintentando…', 'err');
   } else if(!pending.size){
-    setStatus('Guardado ✓', 'ok');
+    // el resto de cambios SÍ se guardan; avisamos de los campos que fallaron antes
+    setStatus(failedByKey.size
+      ? 'Guardado ✓ · ⚠ ' + failedByKey.size + ' campo(s) sin guardar (en rojo)'
+      : 'Guardado ✓', failedByKey.size ? 'err' : 'ok');
   }
   if(retry){
     const tries = Math.max(...Array.from(pending.values()).map(i => i.tries), 1);
@@ -1192,14 +1203,9 @@ document.getElementById('btnPrintSheets').addEventListener('click', async () => 
 });
 
 function boot(){
-  if(!getPin()){ showLock(); return; }
-  const cached = loadDataCache();
-  if(cached){
-    roomsData = cached.data;
-    render();
-    document.getElementById('lastSync').textContent = 'Datos de las ' + new Date(cached.t).toLocaleTimeString('es-ES', {hour:'2-digit', minute:'2-digit'}) + ' (actualizando…)';
-  }
-  loadData();
+  // Siempre empieza por la pantalla del PIN; no se muestra ningún dato antes.
+  clearPin();
+  showLock();
 }
 boot();
 </script>
