@@ -144,6 +144,11 @@
     border-color: var(--ok);
   }
 
+  .field.error input, .field.error select, .field.error .rich-field,
+  .bed-title .especialidad-select.error{
+    border-color:#b3261e !important; background:#fdecea;
+  }
+
   /* ===== ALINEACIÓN HORIZONTAL SV / CD ===== */
   .sv-row{ display:flex; flex-direction:row; align-items:center; justify-content:space-around; gap:8px; width:100%; }
   .sv-group-sv{ display:flex; flex-direction:row; align-items:center; gap:4px; }
@@ -201,7 +206,7 @@
 </head>
 <body>
 
-<div id="lockScreen">
+<div id="lockScreen" class="hidden">
   <div class="lock-box">
     <h2>Acceso restringido</h2>
     <p>Introduce el PIN de la unidad para ver el relevo</p>
@@ -273,7 +278,6 @@ const VIA_COLORS = {
 };
 
 let roomsData = [];
-let saveTimers = {};
 
 let capacities = { 
   nombre: 45,
@@ -283,37 +287,132 @@ let capacities = {
   otros: 150 
 };
 
-function getPin(){ return sessionStorage.getItem('relevoPin') || ''; }
+// ===== PIN: se guarda en el dispositivo (no se pierde al recargar ni al
+// volver de otra app en el móvil) y caduca a las 12 h SIN uso =====
+const PIN_KEY = 'relevoPin';
+const PIN_TTL_MS = 12 * 60 * 60 * 1000;
 
-async function loadData(){
-  setStatus('Cargando…', '');
+function getPin(){
   try{
-    const res = await fetch(APPS_SCRIPT_URL + '?action=read&pin=' + encodeURIComponent(getPin()));
-    const json = await res.json();
-    if(!json.ok){
-      if(json.error === 'PIN incorrecto'){
-        sessionStorage.removeItem('relevoPin');
-        showLock('PIN incorrecto. Inténtalo de nuevo.');
-        return false;
-      }
-      throw new Error(json.error || 'Error desconocido');
+    const raw = localStorage.getItem(PIN_KEY);
+    if(raw){
+      const o = JSON.parse(raw);
+      if(o && o.pin && (Date.now() - o.t) < PIN_TTL_MS) return o.pin;
+      localStorage.removeItem(PIN_KEY);
     }
-    roomsData = json.data;
-    if(json.capacities) capacities = Object.assign(capacities, json.capacities);
-    render();
-    setStatus('Actualizado', 'ok');
-    document.getElementById('lastSync').textContent = 'Última actualización: ' + new Date().toLocaleTimeString('es-ES');
-    return true;
+  }catch(e){}
+  try{ return sessionStorage.getItem(PIN_KEY) || ''; }catch(e){ return ''; }
+}
+function setPin(pin){
+  try{ localStorage.setItem(PIN_KEY, JSON.stringify({ pin, t: Date.now() })); }
+  catch(e){ try{ sessionStorage.setItem(PIN_KEY, pin); }catch(e2){} }
+}
+function clearPin(){
+  try{ localStorage.removeItem(PIN_KEY); }catch(e){}
+  try{ sessionStorage.removeItem(PIN_KEY); }catch(e){}
+}
+
+// ===== Copia de los últimos datos (solo mientras la pestaña esté abierta)
+// para pintar la web al instante y refrescar en segundo plano =====
+const CACHE_KEY = 'relevoCache';
+let cacheTimer = null;
+function saveDataCache(){
+  try{ sessionStorage.setItem(CACHE_KEY, JSON.stringify({ t: Date.now(), data: roomsData })); }catch(e){}
+}
+function saveDataCacheSoon(){ clearTimeout(cacheTimer); cacheTimer = setTimeout(saveDataCache, 500); }
+function loadDataCache(){
+  try{
+    const o = JSON.parse(sessionStorage.getItem(CACHE_KEY));
+    return (o && Array.isArray(o.data) && o.data.length) ? o : null;
+  }catch(e){ return null; }
+}
+function clearDataCache(){ try{ sessionStorage.removeItem(CACHE_KEY); }catch(e){} }
+function patchCache(room, field, value, html){
+  for(const r of roomsData){
+    const idx = r.roomL === room ? 0 : (r.roomR === room ? 1 : -1);
+    if(idx < 0) continue;
+    const bed = r.beds[idx];
+    bed[field] = value;
+    if(html !== undefined) bed[field + 'Html'] = html;
+    saveDataCacheSoon();
+    return;
+  }
+}
+
+// ===== Llamadas al Apps Script: con tiempo máximo y respuesta validada =====
+async function callApi(url, options, timeoutMs){
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 60000);
+  try{
+    const res = await fetch(url, Object.assign({ keepalive: true }, options || {}, { signal: ctrl.signal }));
+    const txt = await res.text();
+    try{ return JSON.parse(txt); }
+    catch(e){ throw new Error('Google no ha respondido bien (puede estar saturado)'); }
   }catch(err){
-    setStatus('Error al cargar: ' + err.message, 'err');
+    if(err.name === 'AbortError') throw new Error('Tiempo de espera agotado');
+    if(err.message === 'Failed to fetch' || err.message === 'Load failed') throw new Error('Sin conexión con Google');
+    throw err;
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
+let loadPromise = null;
+function loadData(){
+  if(loadPromise) return loadPromise;
+  loadPromise = doLoadData().finally(() => { loadPromise = null; });
+  return loadPromise;
+}
+
+async function doLoadData(){
+  setStatus('Cargando…', '');
+  const pin = getPin();
+  const url = APPS_SCRIPT_URL + '?action=read&pin=' + encodeURIComponent(pin);
+  let json = null, lastErr = null;
+  for(let attempt = 0; attempt < 2 && !json; attempt++){
+    try{ json = await callApi(url, {}, 60000); }
+    catch(err){ lastErr = err; }
+  }
+  if(!json){
+    setStatus('Error al cargar: ' + (lastErr ? lastErr.message : 'desconocido'), 'err');
     return false;
   }
+  if(!json.ok){
+    if(json.error === 'PIN incorrecto'){
+      clearPin(); clearDataCache();
+      showLock('PIN incorrecto. Inténtalo de nuevo.');
+      return false;
+    }
+    setStatus('Error al cargar: ' + (json.error || 'desconocido'), 'err');
+    return false;
+  }
+  setPin(pin);            // renueva las 12 h de sesión
+  hideLock();
+  roomsData = json.data;
+  saveDataCache();
+  if(isUserBusy()){
+    setStatus('Actualizado (no se repinta mientras editas; pulsa ↻ al terminar)', 'ok');
+  } else {
+    render();
+    setStatus('Actualizado', 'ok');
+  }
+  document.getElementById('lastSync').textContent = 'Última actualización: ' + new Date().toLocaleTimeString('es-ES');
+  if(pending.size) flushQueue();
+  return true;
+}
+
+function isUserBusy(){
+  if(pending.size || saving) return true;
+  const a = document.activeElement;
+  return !!(a && a !== document.body && document.getElementById('rooms').contains(a));
 }
 
 function showLock(errMsg){
   document.getElementById('lockScreen').classList.remove('hidden');
   document.getElementById('lockErr').textContent = errMsg || '';
   const input = document.getElementById('pinInput');
+  const btn = document.getElementById('btnUnlock');
+  input.disabled = false; btn.disabled = false; btn.textContent = 'Entrar';
   input.value = '';
   setTimeout(() => input.focus(), 50);
 }
@@ -323,30 +422,31 @@ function hideLock(){ document.getElementById('lockScreen').classList.add('hidden
 async function tryUnlock(){
   const pin = document.getElementById('pinInput').value.trim();
   if(!pin){ return; }
-  sessionStorage.setItem('relevoPin', pin);
+  setPin(pin);
   document.getElementById('lockErr').textContent = '';
 
   const btn = document.getElementById('btnUnlock');
   const pinInputEl = document.getElementById('pinInput');
-  const originalLabel = btn.textContent;
   btn.disabled = true;
   pinInputEl.disabled = true;
   btn.textContent = 'Entrando…';
 
   const success = await loadData();
 
-  if(success){
-    hideLock();
-  } else {
-    btn.disabled = false;
+  if(!success){
     pinInputEl.disabled = false;
-    btn.textContent = originalLabel;
+    btn.disabled = false;
+    btn.textContent = 'Entrar';
+    const lockVisible = !document.getElementById('lockScreen').classList.contains('hidden');
+    if(lockVisible && !document.getElementById('lockErr').textContent){
+      document.getElementById('lockErr').textContent = 'No se pudo conectar. Inténtalo de nuevo.';
+    }
   }
 }
 
 document.getElementById('btnUnlock').addEventListener('click', tryUnlock);
 document.getElementById('pinInput').addEventListener('keydown', (e) => { if(e.key === 'Enter') tryUnlock(); });
-document.getElementById('btnRefresh').addEventListener('click', loadData);
+document.getElementById('btnRefresh').addEventListener('click', () => loadData());
 
 function setStatus(msg, cls){
   const el = document.getElementById('status');
@@ -356,7 +456,13 @@ function setStatus(msg, cls){
 
 function render(){
   const main = document.getElementById('rooms');
-  main.innerHTML = '';
+  // conservar qué habitaciones estaban desmarcadas para imprimir
+  const unchecked = new Set();
+  main.querySelectorAll('.room').forEach(r => {
+    const chk = r.querySelector('.printChk');
+    if(chk && !chk.checked) unchecked.add(r.dataset.roomL);
+  });
+  const frag = document.createDocumentFragment();
   roomsData.forEach(room => {
     const div = document.createElement('div');
     div.className = 'room';
@@ -364,7 +470,7 @@ function render(){
 
     const head = document.createElement('div');
     head.className = 'room-head';
-    head.innerHTML = `<label><input type="checkbox" class="printChk" checked> Hab. ${room.roomL.replace(/[PV]$/,'')}</label>`;
+    head.innerHTML = `<label><input type="checkbox" class="printChk" ${unchecked.has(room.roomL) ? '' : 'checked'}> Hab. ${room.roomL.replace(/[PV]$/,'')}</label>`;
     div.appendChild(head);
 
     const bedsWrap = document.createElement('div');
@@ -375,8 +481,9 @@ function render(){
       bedsWrap.appendChild(renderBed(roomCode, bedLetter, bed));
     });
     div.appendChild(bedsWrap);
-    main.appendChild(div);
+    frag.appendChild(div);
   });
+  main.replaceChildren(frag);
 }
 
 function renderBed(roomCode, bedLetter, bed){
@@ -661,34 +768,141 @@ function enforceDdMm(el){
   });
 }
 
-function scheduleSave(roomCode, field, value, box){
-  const key = roomCode + '|' + field;
-  clearTimeout(saveTimers[key]);
-  saveTimers[key] = setTimeout(() => saveField(roomCode, field, value, box), 700);
+// ===== GUARDADO AUTOMÁTICO: cola con reintentos =====
+// - Un solo envío a la vez (así no se pisan ni se saturan los candados de Google)
+// - Los cambios pendientes se agrupan en una sola petición
+// - Si falla la conexión, se reintenta solo; el campo sigue en naranja hasta guardarse
+// - Si falla UN campo concreto (p. ej. un error de la celda), se marca en rojo
+//   con el motivo y los demás se guardan igual
+const SAVE_DEBOUNCE_MS = 700;
+const MAX_TRIES = 5;
+const pending = new Map();   // clave "hab|campo" -> cambio pendiente
+let saving = false;
+let saveSeq = 0;
+const failedByKey = new Map();   // campos que NO se han podido guardar -> motivo
+
+function queueSave(item){
+  const key = item.room + '|' + item.field;
+  const old = pending.get(key);
+  if(old && old.timer) clearTimeout(old.timer);
+  failedByKey.delete(key);
+  item.key = key; item.tries = 0; item.ready = false; item.seq = ++saveSeq;
+  if(item.box){ item.box.classList.add('dirty'); item.box.classList.remove('saved', 'error'); }
+  item.timer = setTimeout(() => { item.timer = null; item.ready = true; flushQueue(); }, SAVE_DEBOUNCE_MS);
+  pending.set(key, item);
 }
 
-async function saveField(roomCode, field, value, box){
+function scheduleSave(roomCode, field, value, box){
+  queueSave({ kind: 'plain', room: roomCode, field, value, box });
+}
+function scheduleSaveRich(div, box){
+  queueSave({ kind: 'rich', room: div.dataset.room, field: div.dataset.field, div, box });
+}
+
+function buildUpdate(item){
+  if(item.kind === 'rich'){
+    const { text, runs } = extractRuns(item.div);
+    item.sentText = text;
+    item.sentHtml = item.div.innerHTML;
+    return {
+      rich: true, room: item.room, field: item.field, text,
+      runs: runs.map(r => ({
+        start: r.start, end: r.end, bold: r.bold,
+        size: r.size === 'large' ? 14 : r.size === 'small' ? 11 : null
+      }))
+    };
+  }
+  return { room: item.room, field: item.field, value: item.value };
+}
+
+function flushNow(){
+  pending.forEach(i => { if(i.timer){ clearTimeout(i.timer); i.timer = null; } i.ready = true; });
+  flushQueue();
+}
+
+async function flushQueue(){
+  if(saving) return;
+  const batch = Array.from(pending.values()).filter(i => i.ready);
+  if(!batch.length) return;
+  saving = true;
+  batch.forEach(i => pending.delete(i.key));
   setStatus('Guardando…', 'saving');
+
+  let results = null, fatalErr = null, pinProblem = false;
   try{
-    const res = await fetch(APPS_SCRIPT_URL, {
+    const json = await callApi(APPS_SCRIPT_URL, {
       method: 'POST',
       headers: {'Content-Type': 'text/plain;charset=utf-8'},
-      body: JSON.stringify({ action:'write', room: roomCode, field, value, pin: getPin() })
-    });
-    const json = await res.json();
-    if(!json.ok){
-      if(json.error === 'PIN incorrecto'){
-        sessionStorage.removeItem('relevoPin');
-        showLock('Tu sesión ha caducado. Vuelve a introducir el PIN.');
-      }
-      throw new Error(json.error || 'Error al guardar');
+      body: JSON.stringify({ action: 'writeMany', updates: batch.map(buildUpdate), pin: getPin() })
+    }, 60000);
+    if(json.ok){
+      results = json.results || [];
+    } else if(json.error === 'PIN incorrecto'){
+      pinProblem = true;
+    } else if(json.error === 'Acción POST desconocida'){
+      fatalErr = new Error('Falta publicar la nueva versión del Apps Script (code.gs)');
+      fatalErr.permanent = true;
+    } else {
+      fatalErr = new Error(json.error || 'Error al guardar');
     }
-    box.classList.remove('dirty'); box.classList.add('saved');
+  }catch(err){ fatalErr = err; }
+
+  let retry = false;
+  const failed = [];
+  batch.forEach((item, idx) => {
+    const newer = pending.get(item.key);       // si se editó de nuevo mientras tanto, manda lo nuevo
+    const r = results ? results[idx] : null;
+    if(r && r.ok){
+      failedByKey.delete(item.key);
+      if(item.kind === 'rich') patchCache(item.room, item.field, item.sentText, item.sentHtml);
+      else patchCache(item.room, item.field, item.value);
+      if(!newer && item.box){ item.box.classList.remove('dirty', 'error'); item.box.classList.add('saved'); }
+      return;
+    }
+    if(newer) return;
+    if(r && !r.ok){                              // fallo concreto de ese campo: no se reintenta
+      if(item.box){ item.box.classList.remove('dirty', 'saved'); item.box.classList.add('error'); }
+      failed.push(r.error || 'Error al guardar'); failedByKey.set(item.key, failed[failed.length-1]);
+      return;
+    }
+    // fallo de toda la petición (conexión, candado ocupado, PIN...)
+    if(pinProblem || (!fatalErr.permanent && ++item.tries < MAX_TRIES)){
+      item.ready = true; pending.set(item.key, item); retry = true;
+    } else {
+      if(item.box){ item.box.classList.remove('dirty', 'saved'); item.box.classList.add('error'); }
+      failed.push(fatalErr.message); failedByKey.set(item.key, fatalErr.message);
+    }
+  });
+
+  saving = false;
+
+  if(pinProblem){
+    clearPin();
+    showLock('Tu sesión ha caducado. Vuelve a introducir el PIN (tus cambios se guardarán al entrar).');
+    return;
+  }
+  if(failedByKey.size){
+    setStatus('Error al guardar: ' + failedByKey.values().next().value, 'err');
+  } else if(retry){
+    setStatus('Sin conexión con Google; reintentando…', 'err');
+  } else if(!pending.size){
     setStatus('Guardado ✓', 'ok');
-  }catch(err){
-    setStatus('Error al guardar: ' + err.message, 'err');
+  }
+  if(retry){
+    const tries = Math.max(...Array.from(pending.values()).map(i => i.tries), 1);
+    setTimeout(flushQueue, Math.min(2000 * tries, 10000));
+  } else if(Array.from(pending.values()).some(i => i.ready)){
+    flushQueue();
   }
 }
+
+// Guardar de inmediato al salir de la pestaña/app, al cerrar o al volver la conexión
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'hidden') flushNow(); });
+window.addEventListener('pagehide', flushNow);
+window.addEventListener('online', flushNow);
+window.addEventListener('beforeunload', (e) => {
+  if(pending.size || saving){ flushNow(); e.preventDefault(); e.returnValue = ''; }
+});
 
 // ===== ESCALADO DE CAPACIDAD Y LÍMITE DE SALTOS DE LÍNEA =====
 const SIZE_PX = { small: 11, normal: 13, large: 14 };
@@ -780,6 +994,7 @@ function attachOverflowGuard(div, box){
   const counter = document.createElement('div');
   counter.className = 'char-counter';
   let lastValidHtml = div.innerHTML;
+  let lastH = 0;
 
   function fits(){
     return div.scrollHeight <= div.clientHeight + 1; // +1px de margen por redondeo
@@ -795,8 +1010,13 @@ function attachOverflowGuard(div, box){
     }
   }
 
+  // Si el texto ya venía más largo que la caja, se permite seguir borrando:
+  // solo se bloquea lo que HACE CRECER el contenido por encima de lo anterior.
+  div.addEventListener('focus', () => { lastH = div.scrollHeight; });
+
   div.addEventListener('input', () => {
-    if(!fits()){
+    const h = div.scrollHeight;
+    if(!fits() && h > lastH){
       div.innerHTML = lastValidHtml;
 
       const range = document.createRange();
@@ -810,6 +1030,7 @@ function attachOverflowGuard(div, box){
       return;
     }
     lastValidHtml = div.innerHTML;
+    lastH = h;
     updateCounter();
   });
 
@@ -871,47 +1092,6 @@ function extractRuns(root){
     }
   });
   return { text, runs: merged };
-}
-
-function scheduleSaveRich(div, box){
-  const key = div.dataset.room + '|' + div.dataset.field;
-  clearTimeout(saveTimers[key]);
-  saveTimers[key] = setTimeout(() => saveRichField(div, box), 700);
-}
-
-async function saveRichField(div, box){
-  const { text, runs } = extractRuns(div);
-  const payload = {
-    action: 'writeRich',
-    room: div.dataset.room,
-    field: div.dataset.field,
-    text,
-    runs: runs.map(r => ({
-      start: r.start, end: r.end, bold: r.bold,
-      size: r.size === 'large' ? 14 : r.size === 'small' ? 11 : null
-    })),
-    pin: getPin()
-  };
-  setStatus('Guardando…', 'saving');
-  try{
-    const res = await fetch(APPS_SCRIPT_URL, {
-      method: 'POST',
-      headers: {'Content-Type': 'text/plain;charset=utf-8'},
-      body: JSON.stringify(payload)
-    });
-    const json = await res.json();
-    if(!json.ok){
-      if(json.error === 'PIN incorrecto'){
-        sessionStorage.removeItem('relevoPin');
-        showLock('Tu sesión ha caducado. Vuelve a introducir el PIN.');
-      }
-      throw new Error(json.error || 'Error al guardar');
-    }
-    if(box){ box.classList.remove('dirty'); box.classList.add('saved'); }
-    setStatus('Guardado ✓', 'ok');
-  }catch(err){
-    setStatus('Error al guardar: ' + err.message, 'err');
-  }
 }
 
 // ===== BARRA FLOTANTE DE FORMATO =====
@@ -1011,7 +1191,17 @@ document.getElementById('btnPrintSheets').addEventListener('click', async () => 
   }
 });
 
-if(getPin()){ loadData(); } else { showLock(); }
+function boot(){
+  if(!getPin()){ showLock(); return; }
+  const cached = loadDataCache();
+  if(cached){
+    roomsData = cached.data;
+    render();
+    document.getElementById('lastSync').textContent = 'Datos de las ' + new Date(cached.t).toLocaleTimeString('es-ES', {hour:'2-digit', minute:'2-digit'}) + ' (actualizando…)';
+  }
+  loadData();
+}
+boot();
 </script>
 </body>
 </html>
